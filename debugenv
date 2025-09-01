@@ -1,0 +1,908 @@
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- GUI Variables
+local MapExplorer = {}
+MapExplorer.GUI = nil
+MapExplorer.IsOpen = false
+MapExplorer.CurrentFilter = "All"
+MapExplorer.AllObjects = {}
+
+-- Configuration
+local CONFIG = {
+    GUI_SIZE = {800, 600},
+    KEYBIND = Enum.KeyCode.F1,
+    MAX_DEPTH = 20,
+    TELEPORT_OFFSET = Vector3.new(0, 10, 0)
+}
+
+-- ========================================
+-- UTILITY FUNCTIONS
+-- ========================================
+
+-- Create notification popup
+local function ShowNotification(message, color, duration)
+    local notification = Instance.new("ScreenGui")
+    notification.Name = "MapExplorerNotification"
+    notification.Parent = PlayerGui
+    notification.DisplayOrder = 999
+    
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 320, 0, 60)
+    frame.Position = UDim2.new(1, -340, 0, 20)
+    frame.BackgroundColor3 = color or Color3.fromRGB(40, 40, 40)
+    frame.BorderSizePixel = 0
+    frame.Parent = notification
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+    
+    local shadow = Instance.new("ImageLabel")
+    shadow.Name = "Shadow"
+    shadow.Size = UDim2.new(1, 6, 1, 6)
+    shadow.Position = UDim2.new(0, -3, 0, -3)
+    shadow.BackgroundTransparency = 1
+    shadow.Image = "rbxasset://textures/ui/Controls/DropShadow.png"
+    shadow.ImageColor3 = Color3.new(0, 0, 0)
+    shadow.ImageTransparency = 0.5
+    shadow.ScaleType = Enum.ScaleType.Slice
+    shadow.SliceCenter = Rect.new(12, 12, 12, 12)
+    shadow.Parent = frame
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -20, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = message
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamMedium
+    label.TextWrapped = true
+    label.Parent = frame
+    
+    -- Slide animation
+    local slideIn = TweenService:Create(frame, 
+        TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        {Position = UDim2.new(1, -340, 0, 20)}
+    )
+    
+    frame.Position = UDim2.new(1, 0, 0, 20)
+    slideIn:Play()
+    
+    -- Auto remove
+    game:GetService("Debris"):AddItem(notification, duration or 3)
+end
+
+-- Safe teleport function
+local function SafeTeleport(position)
+    local character = LocalPlayer.Character
+    if not character or not character.PrimaryPart then
+        ShowNotification("❌ Character not available!", Color3.fromRGB(255, 100, 100))
+        return false
+    end
+    
+    local success, error = pcall(function()
+        character:SetPrimaryPartCFrame(CFrame.new(position + CONFIG.TELEPORT_OFFSET))
+    end)
+    
+    if not success then
+        ShowNotification("❌ Teleport failed: " .. tostring(error), Color3.fromRGB(255, 100, 100))
+        return false
+    end
+    
+    return true
+end
+
+-- Get object icon based on type and name
+local function GetObjectIcon(obj)
+    if obj:IsA("SpawnLocation") then return "🌟"
+    elseif obj:IsA("Seat") then return "💺"
+    elseif obj:IsA("VehicleSeat") then return "🚗"
+    elseif obj:IsA("TrussPart") then return "🔗"
+    elseif obj:IsA("WedgePart") then return "📐"
+    elseif obj:IsA("CornerWedgePart") then return "📏"
+    elseif obj:IsA("Part") then
+        local name = obj.Name:lower()
+        if name:find("floor") or name:find("ground") or name:find("base") then
+            return "🟫"
+        elseif name:find("wall") or name:find("barrier") then
+            return "🧱"
+        elseif name:find("door") or name:find("gate") then
+            return "🚪"
+        elseif name:find("light") or name:find("lamp") then
+            return "💡"
+        elseif name:find("water") or name:find("liquid") then
+            return "🌊"
+        else
+            return "⬜"
+        end
+    elseif obj:IsA("Model") then
+        local name = obj.Name:lower()
+        if name:find("car") or name:find("vehicle") then
+            return "🚗"
+        elseif name:find("tree") or name:find("plant") then
+            return "🌳"
+        elseif name:find("house") or name:find("building") then
+            return "🏠"
+        else
+            return "🏗️"
+        end
+    elseif obj:IsA("Folder") then
+        return "📁"
+    elseif obj:IsA("Script") then
+        return "📜"
+    elseif obj:IsA("LocalScript") then
+        return "📝"
+    else
+        return "📦"
+    end
+end
+
+-- ========================================
+-- OBJECT SCANNING SYSTEM
+-- ========================================
+
+local function ScanWorkspace()
+    local objects = {}
+    
+    local function ScanObject(obj, depth, parentPath)
+        if depth > CONFIG.MAX_DEPTH then return end
+        
+        -- Skip certain objects
+        if obj == workspace.Terrain or 
+           obj == workspace.Camera or
+           obj:IsDescendantOf(PlayerGui) or
+           obj:IsA("Player") then
+            return
+        end
+        
+        local objData = {
+            Object = obj,
+            Name = obj.Name,
+            ClassName = obj.ClassName,
+            Icon = GetObjectIcon(obj),
+            Depth = depth,
+            Path = parentPath .. " > " .. obj.Name,
+            Children = #obj:GetChildren(),
+            Position = Vector3.new(0, 0, 0),
+            Size = Vector3.new(0, 0, 0),
+            Material = "N/A",
+            Color = Color3.new(1, 1, 1),
+            CanTeleport = false
+        }
+        
+        -- Get position and properties for Parts
+        if obj:IsA("BasePart") then
+            objData.Position = obj.Position
+            objData.Size = obj.Size
+            objData.Material = obj.Material.Name
+            objData.Color = obj.Color
+            objData.CanTeleport = true
+        elseif obj:IsA("Model") and obj.PrimaryPart then
+            objData.Position = obj.PrimaryPart.Position
+            objData.CanTeleport = true
+        elseif obj:IsA("Model") then
+            -- Find first BasePart for teleport
+            local firstPart = obj:FindFirstChildOfClass("BasePart", true)
+            if firstPart then
+                objData.Position = firstPart.Position
+                objData.CanTeleport = true
+            end
+        end
+        
+        table.insert(objects, objData)
+        
+        -- Scan children
+        for _, child in pairs(obj:GetChildren()) do
+            ScanObject(child, depth + 1, objData.Path)
+        end
+    end
+    
+    -- Start scanning from workspace
+    for _, child in pairs(workspace:GetChildren()) do
+        ScanObject(child, 0, "Workspace")
+    end
+    
+    return objects
+end
+
+-- ========================================
+-- GUI CREATION SYSTEM
+-- ========================================
+
+local function CreateMainGUI()
+    -- Destroy existing GUI
+    if MapExplorer.GUI then
+        MapExplorer.GUI:Destroy()
+    end
+    
+    -- Main ScreenGui
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "DeltaMapExplorer"
+    screenGui.Parent = PlayerGui
+    screenGui.DisplayOrder = 100
+    screenGui.ResetOnSpawn = false
+    
+    -- Main Frame
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "MainFrame"
+    mainFrame.Size = UDim2.new(0, CONFIG.GUI_SIZE[1], 0, CONFIG.GUI_SIZE[2])
+    mainFrame.Position = UDim2.new(0.5, -CONFIG.GUI_SIZE[1]/2, 0.5, -CONFIG.GUI_SIZE[2]/2)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Parent = screenGui
+    
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 12)
+    mainCorner.Parent = mainFrame
+    
+    -- Shadow effect
+    local shadow = Instance.new("ImageLabel")
+    shadow.Name = "Shadow"
+    shadow.Size = UDim2.new(1, 20, 1, 20)
+    shadow.Position = UDim2.new(0, -10, 0, -10)
+    shadow.BackgroundTransparency = 1
+    shadow.Image = "rbxasset://textures/ui/Controls/DropShadow.png"
+    shadow.ImageColor3 = Color3.new(0, 0, 0)
+    shadow.ImageTransparency = 0.3
+    shadow.ScaleType = Enum.ScaleType.Slice
+    shadow.SliceCenter = Rect.new(12, 12, 12, 12)
+    shadow.Parent = mainFrame
+    
+    return screenGui, mainFrame
+end
+
+local function CreateTitleBar(parent)
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 50)
+    titleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = parent
+    
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 12)
+    titleCorner.Parent = titleBar
+    
+    -- Fix bottom corners
+    local cornerFix = Instance.new("Frame")
+    cornerFix.Size = UDim2.new(1, 0, 0, 25)
+    cornerFix.Position = UDim2.new(0, 0, 1, -25)
+    cornerFix.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    cornerFix.BorderSizePixel = 0
+    cornerFix.Parent = titleBar
+    
+    -- Title
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -200, 1, 0)
+    title.Position = UDim2.new(0, 15, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "🗺️ Delta Map Explorer v2.0"
+    title.TextColor3 = Color3.fromRGB(100, 200, 255)
+    title.TextSize = 18
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = titleBar
+    
+    -- Refresh Button
+    local refreshBtn = Instance.new("TextButton")
+    refreshBtn.Name = "RefreshButton"
+    refreshBtn.Size = UDim2.new(0, 100, 0, 35)
+    refreshBtn.Position = UDim2.new(1, -150, 0, 7.5)
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(76, 175, 80)
+    refreshBtn.BorderSizePixel = 0
+    refreshBtn.Text = "🔄 Refresh"
+    refreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    refreshBtn.TextSize = 14
+    refreshBtn.Font = Enum.Font.GothamBold
+    refreshBtn.Parent = titleBar
+    
+    local refreshCorner = Instance.new("UICorner")
+    refreshCorner.CornerRadius = UDim.new(0, 6)
+    refreshCorner.Parent = refreshBtn
+    
+    -- Close Button
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "CloseButton"
+    closeBtn.Size = UDim2.new(0, 35, 0, 35)
+    closeBtn.Position = UDim2.new(1, -40, 0, 7.5)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(244, 67, 54)
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Text = "✕"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize = 16
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.Parent = titleBar
+    
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 6)
+    closeCorner.Parent = closeBtn
+    
+    return titleBar, refreshBtn, closeBtn
+end
+
+local function CreateFilterBar(parent)
+    local filterBar = Instance.new("Frame")
+    filterBar.Name = "FilterBar"
+    filterBar.Size = UDim2.new(1, 0, 0, 45)
+    filterBar.Position = UDim2.new(0, 0, 0, 50)
+    filterBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    filterBar.BorderSizePixel = 0
+    filterBar.Parent = parent
+    
+    -- Search Box
+    local searchFrame = Instance.new("Frame")
+    searchFrame.Size = UDim2.new(0, 320, 0, 35)
+    searchFrame.Position = UDim2.new(0, 10, 0, 5)
+    searchFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    searchFrame.BorderSizePixel = 0
+    searchFrame.Parent = filterBar
+    
+    local searchCorner = Instance.new("UICorner")
+    searchCorner.CornerRadius = UDim.new(0, 6)
+    searchCorner.Parent = searchFrame
+    
+    local searchBox = Instance.new("TextBox")
+    searchBox.Name = "SearchBox"
+    searchBox.Size = UDim2.new(1, -35, 1, 0)
+    searchBox.Position = UDim2.new(0, 10, 0, 0)
+    searchBox.BackgroundTransparency = 1
+    searchBox.PlaceholderText = "🔍 Search objects..."
+    searchBox.Text = ""
+    searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+    searchBox.TextSize = 14
+    searchBox.Font = Enum.Font.Gotham
+    searchBox.TextXAlignment = Enum.TextXAlignment.Left
+    searchBox.Parent = searchFrame
+    
+    local searchIcon = Instance.new("TextLabel")
+    searchIcon.Size = UDim2.new(0, 25, 1, 0)
+    searchIcon.Position = UDim2.new(1, -30, 0, 0)
+    searchIcon.BackgroundTransparency = 1
+    searchIcon.Text = "🔍"
+    searchIcon.TextColor3 = Color3.fromRGB(150, 150, 150)
+    searchIcon.TextSize = 14
+    searchIcon.Parent = searchFrame
+    
+    -- Filter Buttons
+    local filterButtons = {}
+    local filters = {"All", "Parts", "Models", "Folders", "Scripts"}
+    
+    for i, filterName in ipairs(filters) do
+        local filterBtn = Instance.new("TextButton")
+        filterBtn.Name = filterName .. "Filter"
+        filterBtn.Size = UDim2.new(0, 80, 0, 35)
+        filterBtn.Position = UDim2.new(0, 340 + (i-1) * 85, 0, 5)
+        filterBtn.BackgroundColor3 = filterName == "All" and Color3.fromRGB(70, 130, 180) or Color3.fromRGB(50, 50, 50)
+        filterBtn.BorderSizePixel = 0
+        filterBtn.Text = filterName
+        filterBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        filterBtn.TextSize = 12
+        filterBtn.Font = Enum.Font.GothamMedium
+        filterBtn.Parent = filterBar
+        
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 6)
+        btnCorner.Parent = filterBtn
+        
+        filterButtons[filterName] = filterBtn
+    end
+    
+    return filterBar, searchBox, filterButtons
+end
+
+local function CreateObjectsList(parent)
+    local listFrame = Instance.new("ScrollingFrame")
+    listFrame.Name = "ObjectsList"
+    listFrame.Size = UDim2.new(1, -10, 1, -125)
+    listFrame.Position = UDim2.new(0, 5, 0, 95)
+    listFrame.BackgroundTransparency = 1
+    listFrame.BorderSizePixel = 0
+    listFrame.ScrollBarThickness = 8
+    listFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+    listFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+    listFrame.Parent = parent
+    
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.Parent = listFrame
+    
+    return listFrame
+end
+
+local function CreateStatusBar(parent)
+    local statusBar = Instance.new("Frame")
+    statusBar.Name = "StatusBar"
+    statusBar.Size = UDim2.new(1, 0, 0, 30)
+    statusBar.Position = UDim2.new(0, 0, 1, -30)
+    statusBar.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    statusBar.BorderSizePixel = 0
+    statusBar.Parent = parent
+    
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(0, 12)
+    statusCorner.Parent = statusBar
+    
+    -- Fix top corners
+    local cornerFix = Instance.new("Frame")
+    cornerFix.Size = UDim2.new(1, 0, 0, 15)
+    cornerFix.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    cornerFix.BorderSizePixel = 0
+    cornerFix.Parent = statusBar
+    
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Name = "StatusLabel"
+    statusLabel.Size = UDim2.new(1, -20, 1, 0)
+    statusLabel.Position = UDim2.new(0, 10, 0, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "Ready - Press Refresh to scan objects"
+    statusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    statusLabel.TextSize = 12
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = statusBar
+    
+    return statusBar, statusLabel
+end
+
+-- ========================================
+-- OBJECT LIST ITEM CREATION
+-- ========================================
+
+local function CreateObjectItem(objectData, parent)
+    local container = Instance.new("Frame")
+    container.Name = "ObjectItem_" .. objectData.Name
+    container.Size = UDim2.new(1, -5, 0, 70)
+    container.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    container.BorderSizePixel = 0
+    container.Parent = parent
+    
+    local itemCorner = Instance.new("UICorner")
+    itemCorner.CornerRadius = UDim.new(0, 6)
+    itemCorner.Parent = container
+    
+    -- Indent based on depth
+    local indentSize = math.min(objectData.Depth * 12, 60)
+    
+    -- Icon
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 25, 0, 25)
+    icon.Position = UDim2.new(0, 10 + indentSize, 0, 5)
+    icon.BackgroundTransparency = 1
+    icon.Text = objectData.Icon
+    icon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    icon.TextSize = 16
+    icon.Parent = container
+    
+    -- Object Name
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(0.4, -40 - indentSize, 0, 20)
+    nameLabel.Position = UDim2.new(0, 40 + indentSize, 0, 5)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = objectData.Name
+    nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLabel.TextSize = 14
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    nameLabel.Parent = container
+    
+    -- Object Type
+    local typeLabel = Instance.new("TextLabel")
+    typeLabel.Size = UDim2.new(0.25, 0, 0, 18)
+    typeLabel.Position = UDim2.new(0.4, 0, 0, 6)
+    typeLabel.BackgroundTransparency = 1
+    typeLabel.Text = objectData.ClassName
+    typeLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    typeLabel.TextSize = 12
+    typeLabel.Font = Enum.Font.Gotham
+    typeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    typeLabel.Parent = container
+    
+    -- Object Details
+    local detailsLabel = Instance.new("TextLabel")
+    detailsLabel.Size = UDim2.new(0.6, -40 - indentSize, 0, 16)
+    detailsLabel.Position = UDim2.new(0, 40 + indentSize, 0, 26)
+    detailsLabel.BackgroundTransparency = 1
+    detailsLabel.TextColor3 = Color3.fromRGB(140, 140, 140)
+    detailsLabel.TextSize = 11
+    detailsLabel.Font = Enum.Font.Gotham
+    detailsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    detailsLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    detailsLabel.Parent = container
+    
+    -- Set details text based on object type
+    if objectData.CanTeleport then
+        detailsLabel.Text = string.format("Pos: %.1f, %.1f, %.1f", 
+            objectData.Position.X, objectData.Position.Y, objectData.Position.Z)
+        
+        if objectData.Object:IsA("BasePart") then
+            detailsLabel.Text = detailsLabel.Text .. string.format(" | Size: %.1f, %.1f, %.1f", 
+                objectData.Size.X, objectData.Size.Y, objectData.Size.Z)
+        end
+    else
+        detailsLabel.Text = string.format("Children: %d | Path: %s", 
+            objectData.Children, string.sub(objectData.Path, 1, 40))
+    end
+    
+    -- Second details line
+    local detailsLine2 = Instance.new("TextLabel")
+    detailsLine2.Size = UDim2.new(0.6, -40 - indentSize, 0, 16)
+    detailsLine2.Position = UDim2.new(0, 40 + indentSize, 0, 42)
+    detailsLine2.BackgroundTransparency = 1
+    detailsLine2.Text = "Path: " .. objectData.Path
+    detailsLine2.TextColor3 = Color3.fromRGB(120, 120, 120)
+    detailsLine2.TextSize = 10
+    detailsLine2.Font = Enum.Font.Gotham
+    detailsLine2.TextXAlignment = Enum.TextXAlignment.Left
+    detailsLine2.TextTruncate = Enum.TextTruncate.AtEnd
+    detailsLine2.Parent = container
+    
+    -- Action Buttons
+    local buttonsFrame = Instance.new("Frame")
+    buttonsFrame.Size = UDim2.new(0, 90, 1, -10)
+    buttonsFrame.Position = UDim2.new(1, -95, 0, 5)
+    buttonsFrame.BackgroundTransparency = 1
+    buttonsFrame.Parent = container
+    
+    local teleportBtn = Instance.new("TextButton")
+    teleportBtn.Name = "TeleportButton"
+    teleportBtn.Size = UDim2.new(1, 0, 0, 28)
+    teleportBtn.BackgroundColor3 = objectData.CanTeleport and Color3.fromRGB(70, 130, 180) or Color3.fromRGB(60, 60, 60)
+    teleportBtn.BorderSizePixel = 0
+    teleportBtn.Text = objectData.CanTeleport and "🚀 Teleport" or "❌ No TP"
+    teleportBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    teleportBtn.TextSize = 11
+    teleportBtn.Font = Enum.Font.GothamBold
+    teleportBtn.Active = objectData.CanTeleport
+    teleportBtn.Parent = buttonsFrame
+    
+    local teleportCorner = Instance.new("UICorner")
+    teleportCorner.CornerRadius = UDim.new(0, 4)
+    teleportCorner.Parent = teleportBtn
+    
+    local infoBtn = Instance.new("TextButton")
+    infoBtn.Name = "InfoButton"
+    infoBtn.Size = UDim2.new(1, 0, 0, 28)
+    infoBtn.Position = UDim2.new(0, 0, 0, 32)
+    infoBtn.BackgroundColor3 = Color3.fromRGB(255, 152, 0)
+    infoBtn.BorderSizePixel = 0
+    infoBtn.Text = "ℹ️ Info"
+    infoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    infoBtn.TextSize = 11
+    infoBtn.Font = Enum.Font.GothamBold
+    infoBtn.Parent = buttonsFrame
+    
+    local infoCorner = Instance.new("UICorner")
+    infoCorner.CornerRadius = UDim.new(0, 4)
+    infoCorner.Parent = infoBtn
+    
+    -- Button Events
+    if objectData.CanTeleport then
+        teleportBtn.MouseButton1Click:Connect(function()
+            if SafeTeleport(objectData.Position) then
+                ShowNotification("🚀 Teleported to: " .. objectData.Name, Color3.fromRGB(76, 175, 80))
+            end
+        end)
+    end
+    
+    infoBtn.MouseButton1Click:Connect(function()
+        local infoText = string.format("%s (%s)\nPosition: %.1f, %.1f, %.1f\nChildren: %d\nPath: %s",
+            objectData.Name, objectData.ClassName,
+            objectData.Position.X, objectData.Position.Y, objectData.Position.Z,
+            objectData.Children, objectData.Path)
+        ShowNotification(infoText, Color3.fromRGB(33, 150, 243), 5)
+    end)
+    
+    -- Hover Effects
+    local originalColor = container.BackgroundColor3
+    
+    container.MouseEnter:Connect(function()
+        container.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    end)
+    
+    container.MouseLeave:Connect(function()
+        container.BackgroundColor3 = originalColor
+    end)
+    
+    return container
+end
+
+-- ========================================
+-- GUI FUNCTIONALITY
+-- ========================================
+
+local function UpdateObjectsList(objects, searchTerm, filter)
+    local objectsList = MapExplorer.GUI.MainFrame.ObjectsList
+    local statusLabel = MapExplorer.GUI.MainFrame.StatusBar.StatusLabel
+    
+    -- Clear existing items
+    for _, child in pairs(objectsList:GetChildren()) do
+        if child:IsA("Frame") and child.Name:find("ObjectItem_") then
+            child:Destroy()
+        end
+    end
+    
+    -- Filter objects
+    local filteredObjects = {}
+    
+    for _, obj in ipairs(objects) do
+        local passesFilter = true
+        
+        -- Type filter
+        if filter == "Parts" and not obj.Object:IsA("BasePart") then
+            passesFilter = false
+        elseif filter == "Models" and not obj.Object:IsA("Model") then
+            passesFilter = false
+        elseif filter == "Folders" and not obj.Object:IsA("Folder") then
+            passesFilter = false
+        elseif filter == "Scripts" and not (obj.Object:IsA("Script") or obj.Object:IsA("LocalScript")) then
+            passesFilter = false
+        end
+        
+        -- Search filter
+        if searchTerm and searchTerm ~= "" then
+            local searchLower = searchTerm:lower()
+            local nameMatch = obj.Name:lower():find(searchLower)
+            local classMatch = obj.ClassName:lower():find(searchLower)
+            local pathMatch = obj.Path:lower():find(searchLower)
+            
+            if not (nameMatch or classMatch or pathMatch) then
+                passesFilter = false
+            end
+        end
+        
+        if passesFilter then
+            table.insert(filteredObjects, obj)
+        end
+    end
+    
+    -- Create items
+    for _, objData in ipairs(filteredObjects) do
+        CreateObjectItem(objData, objectsList)
+    end
+    
+    -- Update canvas size
+    objectsList.CanvasSize = UDim2.new(0, 0, 0, #filteredObjects * 72)
+    
+    -- Update status
+    statusLabel.Text = string.format("Found %d objects (Total: %d) | Filter: %s", 
+        #filteredObjects, #objects, filter)
+end
+
+local function RefreshObjects()
+    ShowNotification("🔄 Scanning workspace...", Color3.fromRGB(33, 150, 243))
+    
+    -- Use spawn to prevent freezing
+    spawn(function()
+        MapExplorer.AllObjects = ScanWorkspace()
+        
+        if MapExplorer.GUI and MapExplorer.GUI.Parent then
+            local searchBox = MapExplorer.GUI.MainFrame.FilterBar.SearchBox
+            UpdateObjectsList(MapExplorer.AllObjects, searchBox.Text, MapExplorer.CurrentFilter)
+            ShowNotification("✅ Scan complete! Found " .. #MapExplorer.AllObjects .. " objects", Color3.fromRGB(76, 175, 80))
+        end
+    end)
+end
+
+local function SetupEventConnections()
+    local mainFrame = MapExplorer.GUI.MainFrame
+    local titleBar = mainFrame.TitleBar
+    local filterBar = mainFrame.FilterBar
+    
+    -- Title bar buttons
+    titleBar.RefreshButton.MouseButton1Click:Connect(RefreshObjects)
+    titleBar.CloseButton.MouseButton1Click:Connect(function()
+        MapExplorer:Close()
+    end)
+    
+    -- Search functionality
+    local searchBox = filterBar.SearchBox
+    local lastSearchTime = 0
+    
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        lastSearchTime = tick()
+        local currentTime = lastSearchTime
+        
+        -- Debounce search
+        wait(0.3)
+        if tick() - currentTime >= 0.3 and lastSearchTime == currentTime then
+            UpdateObjectsList(MapExplorer.AllObjects, searchBox.Text, MapExplorer.CurrentFilter)
+        end
+    end)
+    
+    -- Filter buttons
+    local filterButtons = {
+        filterBar.AllFilter,
+        filterBar.PartsFilter,
+        filterBar.ModelsFilter,
+        filterBar.FoldersFilter,
+        filterBar.ScriptsFilter
+    }
+    
+    for _, button in ipairs(filterButtons) do
+        button.MouseButton1Click:Connect(function()
+            -- Reset all button colors
+            for _, btn in ipairs(filterButtons) do
+                btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            end
+            
+            -- Highlight selected button
+            button.BackgroundColor3 = Color3.fromRGB(70, 130, 180)
+            
+            -- Update current filter
+            MapExplorer.CurrentFilter = button.Text
+            UpdateObjectsList(MapExplorer.AllObjects, searchBox.Text, MapExplorer.CurrentFilter)
+        end)
+    end
+    
+    -- Button hover effects
+    local function setupButtonHover(button, normalColor, hoverColor)
+        button.MouseEnter:Connect(function()
+            if button.BackgroundColor3 ~= Color3.fromRGB(70, 130, 180) then
+                button.BackgroundColor3 = hoverColor
+            end
+        end)
+        
+        button.MouseLeave:Connect(function()
+            if button.BackgroundColor3 ~= Color3.fromRGB(70, 130, 180) then
+                button.BackgroundColor3 = normalColor
+            end
+        end)
+    end
+    
+    -- Setup hover effects
+    setupButtonHover(titleBar.RefreshButton, Color3.fromRGB(76, 175, 80), Color3.fromRGB(86, 185, 90))
+    setupButtonHover(titleBar.CloseButton, Color3.fromRGB(244, 67, 54), Color3.fromRGB(254, 77, 64))
+    
+    for _, button in ipairs(filterButtons) do
+        setupButtonHover(button, Color3.fromRGB(50, 50, 50), Color3.fromRGB(60, 60, 60))
+    end
+end
+
+-- ========================================
+-- MAIN MAP EXPLORER CLASS
+-- ========================================
+
+function MapExplorer:Open()
+    if self.IsOpen then return end
+    
+    -- Create GUI
+    local screenGui, mainFrame = CreateMainGUI()
+    local titleBar, refreshBtn, closeBtn = CreateTitleBar(mainFrame)
+    local filterBar, searchBox, filterButtons = CreateFilterBar(mainFrame)
+    local objectsList = CreateObjectsList(mainFrame)
+    local statusBar, statusLabel = CreateStatusBar(mainFrame)
+    
+    self.GUI = screenGui
+    self.IsOpen = true
+    
+    -- Setup connections
+    SetupEventConnections()
+    
+    -- Opening animation
+    mainFrame.Size = UDim2.new(0, 0, 0, 0)
+    
+    local openTween = TweenService:Create(mainFrame,
+        TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        {Size = UDim2.new(0, CONFIG.GUI_SIZE[1], 0, CONFIG.GUI_SIZE[2])}
+    )
+    
+    openTween:Play()
+    
+    -- Auto-refresh on open
+    spawn(function()
+        wait(0.6)
+        RefreshObjects()
+    end)
+    
+    ShowNotification("🗺️ Delta Map Explorer opened! Press " .. CONFIG.KEYBIND.Name .. " to toggle", Color3.fromRGB(76, 175, 80))
+end
+
+function MapExplorer:Close()
+    if not self.IsOpen or not self.GUI then return end
+    
+    local mainFrame = self.GUI.MainFrame
+    
+    -- Closing animation
+    local closeTween = TweenService:Create(mainFrame,
+        TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In),
+        {Size = UDim2.new(0, 0, 0, 0)}
+    )
+    
+    closeTween:Play()
+    
+    closeTween.Completed:Connect(function()
+        if self.GUI then
+            self.GUI:Destroy()
+            self.GUI = nil
+        end
+        self.IsOpen = false
+    end)
+    
+    ShowNotification("❌ Map Explorer closed", Color3.fromRGB(244, 67, 54))
+end
+
+function MapExplorer:Toggle()
+    if self.IsOpen then
+        self:Close()
+    else
+        self:Open()
+    end
+end
+
+-- ========================================
+-- INPUT HANDLING
+-- ========================================
+
+local function SetupInputHandling()
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        
+        if input.KeyCode == CONFIG.KEYBIND then
+            MapExplorer:Toggle()
+        end
+    end)
+end
+
+-- ========================================
+-- INITIALIZATION
+-- ========================================
+
+local function Initialize()
+    -- Clean up any existing GUI
+    local existingGui = PlayerGui:FindFirstChild("DeltaMapExplorer")
+    if existingGui then
+        existingGui:Destroy()
+    end
+    
+    -- Setup input handling
+    SetupInputHandling()
+    
+    -- Auto-open on execution
+    MapExplorer:Open()
+    
+    -- Success message
+    print("🗺️ Delta Map Explorer v2.0 loaded successfully!")
+    print("📝 Press " .. CONFIG.KEYBIND.Name .. " to toggle the explorer")
+    print("🚀 Features: Browse, Search, Filter, and Teleport to any object")
+    print("⚡ Optimized for Delta Executor")
+    
+    ShowNotification("🎉 Delta Map Explorer loaded!\nPress " .. CONFIG.KEYBIND.Name .. " to toggle", Color3.fromRGB(76, 175, 80), 4)
+end
+
+-- ========================================
+-- ERROR HANDLING & CLEANUP
+-- ========================================
+
+local function SafeExecute(func, errorMsg)
+    local success, error = pcall(func)
+    if not success then
+        warn("Delta Map Explorer Error: " .. errorMsg .. " - " .. tostring(error))
+        ShowNotification("❌ Error: " .. errorMsg, Color3.fromRGB(244, 67, 54))
+    end
+    return success
+end
+
+-- Player leaving cleanup
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then
+        if MapExplorer.GUI then
+            MapExplorer.GUI:Destroy()
+        end
+    end
+end)
+
+-- ========================================
+-- EXECUTION
+-- ========================================
+
+SafeExecute(Initialize, "Failed to initialize Map Explorer")
